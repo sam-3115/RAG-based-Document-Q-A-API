@@ -5,3 +5,5 @@ faiss-cpu==1.8.0.post1
 numpy==1.26.4
 requests==2.32.3
 python-multipart==0.0.9
+streamlit
+pypdf

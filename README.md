@@ -7,8 +7,7 @@ The system uses **Sentence Transformers** to generate embeddings, **FAISS** for 
 ## 🚀 Live Demo
 
 🔗 **Streamlit App:**  
-https://rag-based-document-qa-api.streamlit.app/
-
+[https://rag-based-document-q-a-api.streamlit.app/]
 ---
 
 ## ✨ Features

@@ -1,98 +1,154 @@
+
 """
-FastAPI service for a RAG-based Document Q&A API.
-
-Endpoints:
-  POST /upload  -> accepts raw text (or a .txt/.pdf file), builds a vector index, returns doc_id
-  POST /query   -> accepts a doc_id + question, returns a grounded answer + source chunks
-  GET  /health  -> simple health check
-
-Run locally:
-  uvicorn app.main:app --reload
-
-Then open http://127.0.0.1:8000/docs for interactive Swagger UI.
+Core RAG pipeline:
+Document -> chunks -> embeddings -> FAISS
+Question -> retrieve chunks -> prompt -> Gemini answer
 """
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from pydantic import BaseModel, Field
+import os
+import re
+import uuid
+from dataclasses import dataclass, field
 
-from app import rag
+import numpy as np
+import faiss
+from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-app = FastAPI(
-    title="RAG Document Q&A API",
-    description="Upload a document, then ask grounded questions about it using retrieval-augmented generation.",
-    version="1.0.0",
-)
+load_dotenv()
 
-
-# ---------------------------------------------------------------------------
-# Request / response schemas
-# ---------------------------------------------------------------------------
-class UploadTextRequest(BaseModel):
-    text: str = Field(..., min_length=1, description="Raw document text to ingest")
-
-
-class UploadResponse(BaseModel):
-    doc_id: str
-    num_chunks: int
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 80
+TOP_K = 3
+GEMINI_MODEL = "gemini-2.5-flash"
 
 
-class QueryRequest(BaseModel):
-    doc_id: str = Field(..., description="doc_id returned by /upload")
-    question: str = Field(..., min_length=1)
-    top_k: int = Field(default=3, ge=1, le=10)
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return []
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        if end < len(text):
+            last_space = chunk.rfind(" ")
+            if last_space != -1:
+                end = start + last_space
+                chunk = text[start:end]
+        chunks.append(chunk.strip())
+        start = end - overlap if end - overlap > start else end
+    return [c for c in chunks if c]
 
 
-class SourceChunk(BaseModel):
-    text: str
-    score: float
+@dataclass
+class VectorStore:
+    model: SentenceTransformer
+    dim: int
+    index: faiss.Index = field(init=False)
+    chunks: list[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        self.index = faiss.IndexFlatIP(self.dim)
+
+    def add(self, chunks: list[str]) -> None:
+        if not chunks:
+            return
+        embeddings = self.model.encode(chunks, normalize_embeddings=True)
+        self.index.add(np.array(embeddings, dtype="float32"))
+        self.chunks.extend(chunks)
+
+    def search(self, query: str, k: int = TOP_K) -> list[tuple[str, float]]:
+        if self.index.ntotal == 0:
+            return []
+        query_vec = self.model.encode([query], normalize_embeddings=True)
+        scores, indices = self.index.search(
+            np.array(query_vec, dtype="float32"),
+            min(k, self.index.ntotal),
+        )
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx == -1:
+                continue
+            results.append((self.chunks[idx], float(score)))
+        return results
 
 
-class QueryResponse(BaseModel):
-    answer: str
-    sources: list[SourceChunk]
+_embedding_model: SentenceTransformer | None = None
+_stores: dict[str, VectorStore] = {}
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+def get_embedding_model() -> SentenceTransformer:
+    global _embedding_model
+    if _embedding_model is None:
+        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    return _embedding_model
 
 
-@app.post("/upload", response_model=UploadResponse)
-def upload_text(payload: UploadTextRequest):
-    """Ingest raw text directly (useful for testing without a file)."""
-    doc_id = rag.ingest_document(payload.text)
-    store = rag.get_store(doc_id)
-    return UploadResponse(doc_id=doc_id, num_chunks=len(store.chunks))
+def ingest_document(text: str) -> str:
+    model = get_embedding_model()
+    dim = model.get_sentence_embedding_dimension()
+    store = VectorStore(model=model, dim=dim)
+    chunks = chunk_text(text)
+    store.add(chunks)
+    doc_id = str(uuid.uuid4())
+    _stores[doc_id] = store
+    return doc_id
 
 
-@app.post("/upload-file", response_model=UploadResponse)
-async def upload_file(file: UploadFile = File(...)):
-    """Ingest a .txt file upload. (Extend this to parse PDFs with pypdf if needed.)"""
-    if not file.filename.endswith(".txt"):
-        raise HTTPException(status_code=400, detail="Only .txt files are supported in this demo.")
-
-    raw_bytes = await file.read()
-    text = raw_bytes.decode("utf-8", errors="ignore")
-
-    doc_id = rag.ingest_document(text)
-    store = rag.get_store(doc_id)
-    return UploadResponse(doc_id=doc_id, num_chunks=len(store.chunks))
+def get_store(doc_id: str) -> VectorStore | None:
+    return _stores.get(doc_id)
 
 
-@app.post("/query", response_model=QueryResponse)
-def query(payload: QueryRequest):
-    try:
-        result = rag.answer_question(payload.doc_id, payload.question, k=payload.top_k)
-    except KeyError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except RuntimeError as e:
-        # e.g. missing GROQ_API_KEY
-        raise HTTPException(status_code=500, detail=str(e))
-
-    return QueryResponse(
-        answer=result["answer"],
-        sources=[SourceChunk(**s) for s in result["sources"]],
+def build_prompt(question: str, context_chunks: list[str]) -> str:
+    context = "\n\n".join(
+        f"[Chunk {i+1}]\n{c}" for i, c in enumerate(context_chunks)
     )
+    return (
+        "You are a helpful assistant. Answer the question using ONLY the context "
+        "below. If the answer isn't in the context, say you don't know instead of "
+        "guessing.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {question}\n"
+        "Answer:"
+    )
+
+
+def call_llm(prompt: str) -> str:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set.")
+
+    llm = ChatGoogleGenerativeAI(
+        model=GEMINI_MODEL,
+        google_api_key=api_key,
+        temperature=0.2,
+    )
+    return llm.invoke(prompt).content
+
+
+def answer_question(doc_id: str, question: str, k: int = TOP_K) -> dict:
+    store = get_store(doc_id)
+    if store is None:
+        raise KeyError(f"No document found for doc_id={doc_id}")
+
+    retrieved = store.search(question, k=k)
+    context_chunks = [c for c, _score in retrieved]
+
+    if not context_chunks:
+        return {
+            "answer": "No relevant context found in the document.",
+            "sources": [],
+        }
+
+    answer = call_llm(build_prompt(question, context_chunks))
+    return {
+        "answer": answer,
+        "sources": [
+            {"text": c, "score": round(s, 4)}
+            for c, s in retrieved
+        ],
+    }

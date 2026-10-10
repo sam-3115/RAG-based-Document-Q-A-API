@@ -1,9 +1,10 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 sentence-transformers==3.0.1
-faiss-cpu==1.8.0.post1
+faiss-cpu==1.15.1
 numpy==1.26.4
 requests==2.32.3
 python-multipart==0.0.9
 streamlit
 pypdf
+langchain-google-genai
